@@ -1,35 +1,40 @@
 # AlgoTrade01 — MetaTrader 5 EA
 
-`Experts/AlgoTrade01.mq5` is a button-controlled MetaTrader 5 Expert Advisor implementing consecutive lot progression.
+`Experts/AlgoTrade01.mq5` implements the confirmed workflow.
 
-## Exact trading behavior
+## Confirmed workflow
 
-- Clicking **BUY** opens a buy order of `0.01` lots.
-- Clicking **SELL** opens a sell order of `0.01` lots.
-- Every order has a monetary TP of `$1 per 0.01 lot` and SL of `$2 per 0.01 lot`.
-- When the order reaches TP, the EA immediately opens another order in the **same direction**, increasing volume by `0.01`:
-  - `0.01` → TP `$1`, SL `$2`
-  - `0.02` → TP `$2`, SL `$4`
-  - `0.03` → TP `$3`, SL `$6`
-  - `0.04` → TP `$4`, SL `$8`
-- This continues consecutively in the same direction until an order hits SL.
-- When SL is hit, the EA reverses direction and restarts at `0.01` lots.
-- Clicking **STOP** closes the EA's positions and stops the sequence.
+For a BUY or SELL signal:
 
-The EA uses `OnTradeTransaction()` and checks the broker's actual deal reason (`DEAL_REASON_TP` or `DEAL_REASON_SL`) so a TP advances the lot size while an SL reverses the signal. Monetary price distances are calculated with `OrderCalcProfit()` using the symbol's tick value, contract size, and account currency.
+1. Open one `0.01` lot position.
+2. The first position has a `$2` stop-loss amount. Its `$1` target is a **trigger**, so the first position stays open when it reaches `$1` profit.
+3. At that `$1` first-position trigger, open 9 more positions in the same direction, each also `0.01` lots. The expected stack is:
+
+```text
+0.01 × 10 positions
+```
+
+4. Each `0.01` position has a `$2` stop loss. The stack is closed together when the combined floating basket profit reaches `$10`.
+5. If any stack position hits its `$2` stop loss, the EA closes the remaining stack and reverses direction, starting a new `0.01` position.
+
+The EA deliberately does not send a broker-side `$1` TP to the first position, because that would close it instead of keeping it open to trigger the 9 additional orders. The `$1` trigger and `$10` combined basket TP are managed by the EA. The `$2` stop loss is applied to every position.
+
+## Controls
+
+- **BUY** starts a BUY sequence.
+- **SELL** starts a SELL sequence.
+- **STOP** closes all positions belonging to this EA and stops the sequence.
+
+## Inputs
+
+- `InpOrderLots`: default `0.01`
+- `InpStackOrders`: default `9`
+- `InpTriggerProfit`: default `1.0`
+- `InpBasketTakeProfit`: default `10.0`
+- `InpStopLossPer001`: default `2.0`
+
+All monetary values are in the MT5 account's deposit currency. `OrderCalcProfit()` is used to calculate symbol-specific price distances. A hedging account is recommended so the 10 positions remain separate.
 
 ## Installation
 
-1. Open MetaTrader 5 and select **File → Open Data Folder**.
-2. Copy `Experts/AlgoTrade01.mq5` into `MQL5/Experts`.
-3. Open the file in MetaEditor and press **Compile**.
-4. Attach the EA to a chart and enable **Algo Trading**.
-5. Test on a demo account first.
-
-## Important notes
-
-- A hedging account is recommended. The progression is designed as one active position at a time; netting accounts are supported for this one-position sequence, but account/broker rules still apply.
-- The values are in the account's deposit currency. If the account currency is USD, they are dollar amounts.
-- The broker must permit the requested volume, volume step, margin, and stop distance. Errors are printed in the Experts tab.
-- If the EA is removed or the terminal is disconnected while an order is open, it cannot react to the next TP/SL until it is running again.
-- This is an execution implementation, not financial advice. Validate it with the Strategy Tester and a demo account before live trading.
+Copy `Experts/AlgoTrade01.mq5` into the terminal's `MQL5/Experts` folder, compile it in MetaEditor, attach it to a chart, and enable **Algo Trading**. Test on a demo account first. Errors and order results are printed in the Experts tab.

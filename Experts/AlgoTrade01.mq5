@@ -1,19 +1,20 @@
 //+------------------------------------------------------------------+
 //| AlgoTrade01.mq5                                                  |
-//| Button-controlled consecutive TP progression EA                  |
+//| First-profit trigger -> 10-position basket -> combined TP        |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.00"
-#property description "BUY/SELL buttons: 0.01, 0.02, 0.03... after TP; reverse after SL"
+#property version "3.00"
+#property description "0.01 trigger, add 9 x 0.01, close basket at $10, reverse at SL"
 
 #include <Trade/Trade.mqh>
 
-input double InpStartingLots       = 0.01;       // First order volume
-input double InpLotIncrement       = 0.01;       // Added after every TP
-input double InpTakeProfitPer001   = 1.0;        // Account currency TP per 0.01 lot
-input double InpStopLossPer001     = 2.0;        // Account currency SL per 0.01 lot
+input double InpOrderLots          = 0.01;       // Every order volume
+input int    InpStackOrders        = 9;          // Orders added after trigger
+input double InpTriggerProfit      = 1.0;        // First-order trigger in account currency
+input double InpBasketTakeProfit   = 10.0;       // Combined basket TP
+input double InpStopLossPer001     = 2.0;        // SL per 0.01 lot
 input ulong  InpMagic              = 20260731;   // EA magic number
-input bool   InpReverseOnStopLoss  = true;       // Reverse after SL
+input bool   InpReverseOnStopLoss  = true;       // Reverse after any EA SL
 input int    InpDeviationPoints    = 20;         // Maximum price deviation
 
 CTrade trade;
@@ -21,11 +22,11 @@ string PREFIX = "AT01_";
 ulong initial_ticket = 0;
 ulong initial_position_id = 0;
 ENUM_POSITION_TYPE direction = WRONG_VALUE;
-double current_lots = 0.0;
 bool running = false;
+bool stacked = false;
 bool processing_exit = false;
 
-// Account-currency amount to price distance for this symbol and volume.
+// Converts account currency to a price distance using the symbol's real tick value.
 double PriceDistanceForMoney(ENUM_ORDER_TYPE order_type, double volume, double money, double entry)
 {
    if(money <= 0.0 || volume <= 0.0) return 0.0;
@@ -55,14 +56,6 @@ double MoneyStopLoss(ENUM_POSITION_TYPE type, double volume, double entry)
    return NormalizeDouble(type == POSITION_TYPE_BUY ? entry - distance : entry + distance, _Digits);
 }
 
-double MoneyTakeProfit(ENUM_POSITION_TYPE type, double volume, double entry)
-{
-   ENUM_ORDER_TYPE order = type == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   double money = InpTakeProfitPer001 * volume / 0.01;
-   double distance = PriceDistanceForMoney(order, volume, money, entry);
-   return NormalizeDouble(type == POSITION_TYPE_BUY ? entry + distance : entry - distance, _Digits);
-}
-
 bool IsOurPosition(ulong ticket)
 {
    if(ticket == 0 || !PositionSelectByTicket(ticket)) return false;
@@ -78,13 +71,24 @@ int OurPositionCount()
    return count;
 }
 
+double OurFloatingProfit()
+{
+   double total = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(IsOurPosition(ticket)) total += PositionGetDouble(POSITION_PROFIT);
+   }
+   return total;
+}
+
 void ResetState()
 {
    initial_ticket = 0;
    initial_position_id = 0;
    direction = WRONG_VALUE;
-   current_lots = 0.0;
    running = false;
+   stacked = false;
 }
 
 void MakeButton(string name, string text, int x, color background)
@@ -92,7 +96,7 @@ void MakeButton(string name, string text, int x, color background)
    ObjectDelete(0, name);
    if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
    {
-      Print("Could not create ", name, ": ", GetLastError());
+      Print("Could not create button ", name, ": ", GetLastError());
       return;
    }
    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
@@ -111,22 +115,23 @@ void MakeButton(string name, string text, int x, color background)
    ChartRedraw(0);
 }
 
-bool ApplyMoneyStops(ulong ticket)
+bool ApplyStopLoss(ulong ticket)
 {
    if(!IsOurPosition(ticket)) return false;
    ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
    double volume = PositionGetDouble(POSITION_VOLUME);
    double entry = PositionGetDouble(POSITION_PRICE_OPEN);
    double sl = MoneyStopLoss(type, volume, entry);
-   double tp = MoneyTakeProfit(type, volume, entry);
-   if(sl == 0.0 || tp == 0.0)
+   if(sl == 0.0)
    {
-      Print("Could not calculate SL/TP. Check symbol tick value and contract specification.");
+      Print("Could not calculate SL for ticket ", ticket);
       return false;
    }
-   if(!trade.PositionModify(ticket, sl, tp))
+   // TP is deliberately zero: the first order's $1 level is a trigger,
+   // and the basket is closed only at the combined $10 target.
+   if(!trade.PositionModify(ticket, sl, 0.0))
    {
-      Print("Could not apply SL/TP to ticket ", ticket, ": ", trade.ResultRetcodeDescription());
+      Print("Could not apply SL to ticket ", ticket, ": ", trade.ResultRetcodeDescription());
       return false;
    }
    return true;
@@ -151,96 +156,117 @@ bool CloseOurPositions()
    return ok && OurPositionCount() == 0;
 }
 
-// Opens exactly one step. The first step is 0.01, the next is 0.02, etc.
-bool OpenStep(ENUM_ORDER_TYPE order_type, double lots)
+// Opens one 0.01 position. It is sent without stops first, then the actual fill
+// price is used to set the $2 stop loss so spread/slippage cannot reject the entry.
+bool OpenOne(ENUM_ORDER_TYPE order_type, bool is_initial)
 {
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol, tick))
-   {
-      Print("No market tick is available for ", _Symbol);
-      return false;
-   }
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpDeviationPoints);
    bool sent = order_type == ORDER_TYPE_BUY
-               ? trade.Buy(lots, _Symbol, 0.0, 0.0, 0.0, "AT01|STEP")
-               : trade.Sell(lots, _Symbol, 0.0, 0.0, 0.0, "AT01|STEP");
+               ? trade.Buy(InpOrderLots, _Symbol, 0.0, 0.0, 0.0, "AT01|STACK")
+               : trade.Sell(InpOrderLots, _Symbol, 0.0, 0.0, 0.0, "AT01|STACK");
    if(!sent)
    {
-      Print("Order of ", DoubleToString(lots, 2), " lots failed: ", trade.ResultRetcodeDescription());
+      Print("Order failed: ", trade.ResultRetcodeDescription());
       return false;
    }
 
-   initial_ticket = 0;
-   initial_position_id = 0;
-   // A hedging account creates one position for this order. Use the comment,
-   // with a fallback to any newly-created EA position for broker variations.
+   ulong found = 0;
    for(int i = PositionsTotal() - 1; i >= 0; --i)
    {
       ulong ticket = PositionGetTicket(i);
-      if(IsOurPosition(ticket) &&
-         (PositionGetString(POSITION_COMMENT) == "AT01|STEP" || initial_ticket == 0))
+      if(IsOurPosition(ticket) && PositionGetString(POSITION_COMMENT) == "AT01|STACK")
       {
-         initial_ticket = ticket;
-         initial_position_id = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
-         direction = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         break;
+         // For additions, an unprotected position is the newly-created one.
+         if(is_initial || PositionGetDouble(POSITION_SL) == 0.0)
+         {
+            found = ticket;
+            break;
+         }
       }
    }
-   if(initial_ticket == 0)
+   if(found == 0)
    {
       Print("Order filled but position could not be identified.");
       return false;
    }
-   current_lots = PositionGetDouble(POSITION_VOLUME);
-   running = true;
-   ApplyMoneyStops(initial_ticket);
-   Print("Opened ", direction == POSITION_TYPE_BUY ? "BUY" : "SELL", " step at ",
-         DoubleToString(current_lots, 2), " lots. TP=$",
-         DoubleToString(InpTakeProfitPer001 * current_lots / 0.01, 2), " SL=$",
-         DoubleToString(InpStopLossPer001 * current_lots / 0.01, 2));
+
+   if(is_initial)
+   {
+      initial_ticket = found;
+      PositionSelectByTicket(found);
+      initial_position_id = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+      direction = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   }
+   ApplyStopLoss(found);
    return true;
 }
 
-void StartDirection(ENUM_ORDER_TYPE order_type)
+void StartSignal(ENUM_ORDER_TYPE order_type)
 {
    if(OurPositionCount() > 0)
    {
-      Print("A basket is already open. Press STOP before starting another signal.");
+      Print("A basket is already active. Press STOP first.");
       return;
    }
    processing_exit = false;
    ResetState();
-   OpenStep(order_type, InpStartingLots);
+   if(OpenOne(order_type, true))
+   {
+      running = true;
+      stacked = false;
+      Print("Started ", direction == POSITION_TYPE_BUY ? "BUY" : "SELL",
+            " 0.01 lot. Trigger=$", DoubleToString(InpTriggerProfit, 2),
+            ", SL=$", DoubleToString(InpStopLossPer001 * InpOrderLots / 0.01, 2));
+   }
 }
 
-void HandleExit(ENUM_DEAL_REASON reason)
+void AddStack()
 {
-   if(!running || processing_exit) return;
+   int successful = 0;
+   for(int i = 0; i < InpStackOrders; i++)
+   {
+      if(OpenOne(direction == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, false))
+         successful++;
+   }
+   stacked = successful > 0;
+   Print("Stack opened: ", successful, " additional positions; total expected ", successful + 1);
+}
+
+void ReverseAfterStop()
+{
+   if(processing_exit) return;
    processing_exit = true;
    ENUM_POSITION_TYPE old_direction = direction;
-   double next_lots = NormalizeDouble(current_lots + InpLotIncrement, 2);
    CloseOurPositions();
-
-   if(reason == DEAL_REASON_TP)
-   {
-      // TP: same signal, increase volume by 0.01 and continue forever until SL.
-      Print("Take profit reached. Opening next same-direction step: ",
-            DoubleToString(next_lots, 2), " lots.");
-      initial_ticket = 0;
-      initial_position_id = 0;
-      OpenStep(old_direction == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, next_lots);
-   }
-   else
-   {
-      // SL: reverse signal and restart at the initial volume.
-      Print("Stop loss reached. Reversing and restarting at ",
-            DoubleToString(InpStartingLots, 2), " lots.");
-      ResetState();
-      if(InpReverseOnStopLoss)
-         OpenStep(old_direction == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY, InpStartingLots);
-   }
+   ResetState();
+   if(InpReverseOnStopLoss)
+      StartSignal(old_direction == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY);
    processing_exit = false;
+}
+
+void ManageStrategy()
+{
+   if(!running || initial_ticket == 0 || processing_exit) return;
+   if(!IsOurPosition(initial_ticket)) return; // SL is handled by OnTradeTransaction.
+
+   if(!stacked && PositionSelectByTicket(initial_ticket) &&
+      PositionGetDouble(POSITION_PROFIT) >= InpTriggerProfit)
+   {
+      Print("Initial order reached $", DoubleToString(InpTriggerProfit, 2),
+            ". Keeping it open and adding ", InpStackOrders, " more 0.01 orders.");
+      AddStack();
+   }
+
+   if(stacked && OurFloatingProfit() >= InpBasketTakeProfit)
+   {
+      processing_exit = true;
+      Print("Basket profit reached $", DoubleToString(OurFloatingProfit(), 2),
+            ". Closing the entire stack.");
+      CloseOurPositions();
+      ResetState();
+      processing_exit = false;
+   }
 }
 
 int OnInit()
@@ -249,19 +275,22 @@ int OnInit()
    MakeButton(PREFIX + "BUY", "BUY", 10, clrForestGreen);
    MakeButton(PREFIX + "SELL", "SELL", 110, clrFireBrick);
    MakeButton(PREFIX + "STOP", "STOP", 210, clrDarkOrange);
+   EventSetTimer(1);
    if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
-      Print("WARNING: Use a hedging account. Netting accounts cannot keep this step sequence independently.");
+      Print("WARNING: A hedging account is recommended for 10 separate stack positions.");
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
    ObjectDelete(0, PREFIX + "BUY");
    ObjectDelete(0, PREFIX + "SELL");
    ObjectDelete(0, PREFIX + "STOP");
 }
 
-void OnTick() {}
+void OnTick() { ManageStrategy(); }
+void OnTimer() { ManageStrategy(); }
 
 void OnTradeTransaction(const MqlTradeTransaction &transaction,
                         const MqlTradeRequest &request,
@@ -272,19 +301,16 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
    if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) return;
    if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagic) return;
    if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) return;
-   ulong position_id = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
-   if(position_id != initial_position_id) return;
    ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal, DEAL_REASON);
-   if(reason == DEAL_REASON_TP) HandleExit(reason);
-   else if(reason == DEAL_REASON_SL) HandleExit(reason);
+   if(reason == DEAL_REASON_SL) ReverseAfterStop();
 }
 
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
 {
    if(id != CHARTEVENT_OBJECT_CLICK) return;
    Print("AlgoTrade01 button clicked: ", sparam);
-   if(sparam == PREFIX + "BUY") StartDirection(ORDER_TYPE_BUY);
-   else if(sparam == PREFIX + "SELL") StartDirection(ORDER_TYPE_SELL);
+   if(sparam == PREFIX + "BUY") StartSignal(ORDER_TYPE_BUY);
+   else if(sparam == PREFIX + "SELL") StartSignal(ORDER_TYPE_SELL);
    else if(sparam == PREFIX + "STOP")
    {
       processing_exit = true;
