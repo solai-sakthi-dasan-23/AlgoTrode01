@@ -1,41 +1,35 @@
 # AlgoTrade01 — MetaTrader 5 EA
 
-`Experts/AlgoTrade01.mq5` is a button-controlled MetaTrader 5 Expert Advisor (EA) implementing the requested AlgoTrade01 workflow.
+`Experts/AlgoTrade01.mq5` is a button-controlled MetaTrader 5 Expert Advisor implementing consecutive lot progression.
 
-## Controls
+## Exact trading behavior
 
-The EA adds three chart buttons:
+- Clicking **BUY** opens a buy order of `0.01` lots.
+- Clicking **SELL** opens a sell order of `0.01` lots.
+- Every order has a monetary TP of `$1 per 0.01 lot` and SL of `$2 per 0.01 lot`.
+- When the order reaches TP, the EA immediately opens another order in the **same direction**, increasing volume by `0.01`:
+  - `0.01` → TP `$1`, SL `$2`
+  - `0.02` → TP `$2`, SL `$4`
+  - `0.03` → TP `$3`, SL `$6`
+  - `0.04` → TP `$4`, SL `$8`
+- This continues consecutively in the same direction until an order hits SL.
+- When SL is hit, the EA reverses direction and restarts at `0.01` lots.
+- Clicking **STOP** closes the EA's positions and stops the sequence.
 
-- **BUY** — opens one 0.01-lot buy order.
-- **SELL** — opens one 0.01-lot sell order.
-- **STOP** — closes all positions opened by this EA and disables the current basket.
-
-Only one basket can be active at a time. The EA identifies its positions using the configurable magic number (`InpMagic`).
-
-## Workflow implemented
-
-1. The first order is opened at `InpLots` (default `0.01`). Each order receives a monetary stop loss of `$2 per 0.01 lot` and take profit of `$1 per 0.01 lot`.
-2. When the initial order reaches 20 pips of favorable movement, the EA requests nine more 0.01-lot orders in the same direction. Each additional order receives the same proportional monetary levels.
-3. Therefore, a 0.01-lot order has `$1` TP / `$2` SL; a 0.02-lot order would have `$2` TP / `$4` SL; a 0.03-lot order would have `$3` TP / `$6` SL, and so on. The current basket uses ten separate 0.01-lot orders as requested.
-4. If the initial order's stop loss is hit, the remaining basket is closed and a new basket is opened in the opposite direction.
-5. The same stop-loss reversal behavior applies to the next direction.
-
-Monetary distances are calculated using MT5 `OrderCalcProfit`, so they adapt to the symbol's tick value, contract size, exchange rate, and account currency. The EA retains the 20-pip scale-in trigger from the original workflow.
+The EA uses `OnTradeTransaction()` and checks the broker's actual deal reason (`DEAL_REASON_TP` or `DEAL_REASON_SL`) so a TP advances the lot size while an SL reverses the signal. Monetary price distances are calculated with `OrderCalcProfit()` using the symbol's tick value, contract size, and account currency.
 
 ## Installation
 
-1. Open MetaTrader 5 and choose **File → Open Data Folder**.
-2. Copy `Experts/AlgoTrade01.mq5` into the terminal's `MQL5/Experts` directory.
-3. Open MetaEditor, open the file, and press **Compile**.
-4. Attach `AlgoTrade01` to the desired chart and enable **Algo Trading**.
-5. Test in the Strategy Tester or a demo account before using live funds.
+1. Open MetaTrader 5 and select **File → Open Data Folder**.
+2. Copy `Experts/AlgoTrade01.mq5` into `MQL5/Experts`.
+3. Open the file in MetaEditor and press **Compile**.
+4. Attach the EA to a chart and enable **Algo Trading**.
+5. Test on a demo account first.
 
-## Important limitations and settings
+## Important notes
 
-- The requested ten separate positions require a **hedging** MT5 account. A netting account aggregates positions, so it cannot represent ten independent 0.01-lot positions.
-- Every order receives its own broker-side SL/TP. The monetary inputs are `InpTakeProfitPer001` (default `$1`) and `InpStopLossPer001` (default `$2`) for each 0.01 lot.
-- Because the initial order now has a `$1` take profit, it may reach its TP before the original 20-pip scale-in trigger on some symbols. If you want scaling to occur first, the TP behavior and scale-in trigger need to be defined as a combined basket rule.
-- `InpScaleInPips`, `InpBasketClosePips`, `InpLots`, `InpAddOrders`, and `InpReverseOnStopLoss` are inputs and can be changed when attaching the EA.
-- “Pips” are calculated conventionally: one pip equals 10 points for 3/5-digit symbols and one point for 2/4-digit symbols; the dollar SL/TP itself is calculated separately from the symbol specification.
-- Broker minimum volume, volume step, margin, spread, market hours, and execution rules can cause an order to be rejected. The EA logs rejected orders in the Experts tab.
-- This is an order-execution implementation, not financial advice. Validate behavior with a demo account and broker-specific symbol settings first.
+- A hedging account is recommended. The progression is designed as one active position at a time; netting accounts are supported for this one-position sequence, but account/broker rules still apply.
+- The values are in the account's deposit currency. If the account currency is USD, they are dollar amounts.
+- The broker must permit the requested volume, volume step, margin, and stop distance. Errors are printed in the Experts tab.
+- If the EA is removed or the terminal is disconnected while an order is open, it cannot react to the next TP/SL until it is running again.
+- This is an execution implementation, not financial advice. Validate it with the Strategy Tester and a demo account before live trading.
