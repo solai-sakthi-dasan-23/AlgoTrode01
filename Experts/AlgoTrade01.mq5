@@ -158,13 +158,13 @@ bool CloseOurPositions()
 
 // Opens one 0.01 position. It is sent without stops first, then the actual fill
 // price is used to set the $2 stop loss so spread/slippage cannot reject the entry.
-bool OpenOne(ENUM_ORDER_TYPE order_type, bool is_initial)
+bool OpenOne(ENUM_ORDER_TYPE order_type, double lots, bool is_initial)
 {
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpDeviationPoints);
    bool sent = order_type == ORDER_TYPE_BUY
-               ? trade.Buy(InpOrderLots, _Symbol, 0.0, 0.0, 0.0, "AT01|STACK")
-               : trade.Sell(InpOrderLots, _Symbol, 0.0, 0.0, 0.0, "AT01|STACK");
+               ? trade.Buy(lots, _Symbol, 0.0, 0.0, 0.0, "AT01|STACK")
+               : trade.Sell(lots, _Symbol, 0.0, 0.0, 0.0, "AT01|STACK");
    if(!sent)
    {
       Print("Order failed: ", trade.ResultRetcodeDescription());
@@ -202,7 +202,7 @@ bool OpenOne(ENUM_ORDER_TYPE order_type, bool is_initial)
    return true;
 }
 
-void StartSignal(ENUM_ORDER_TYPE order_type)
+void StartSignal(ENUM_ORDER_TYPE order_type, double lots)
 {
    if(OurPositionCount() > 0)
    {
@@ -211,13 +211,13 @@ void StartSignal(ENUM_ORDER_TYPE order_type)
    }
    processing_exit = false;
    ResetState();
-   if(OpenOne(order_type, true))
+   if(OpenOne(order_type, lots, true))
    {
       running = true;
       stacked = false;
       Print("Started ", direction == POSITION_TYPE_BUY ? "BUY" : "SELL",
             " 0.01 lot. Trigger=$", DoubleToString(InpTriggerProfit, 2),
-            ", SL=$", DoubleToString(InpStopLossPer001 * InpOrderLots / 0.01, 2));
+            ", SL=$", DoubleToString(InpStopLossPer001 * lots / 0.01, 2));
    }
 }
 
@@ -226,22 +226,26 @@ void AddStack()
    int successful = 0;
    for(int i = 0; i < InpStackOrders; i++)
    {
-      if(OpenOne(direction == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, false))
+      if(OpenOne(direction == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, InpOrderLots, false))
          successful++;
    }
    stacked = successful > 0;
    Print("Stack opened: ", successful, " additional positions; total expected ", successful + 1);
 }
 
-void ReverseAfterStop()
+void ReverseAfterStop(double stopped_lots)
 {
    if(processing_exit) return;
    processing_exit = true;
    ENUM_POSITION_TYPE old_direction = direction;
+   double reverse_lots = stopped_lots > 0.0 ? stopped_lots : InpOrderLots;
    CloseOurPositions();
    ResetState();
    if(InpReverseOnStopLoss)
-      StartSignal(old_direction == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY);
+   {
+      Print("SL reversal: opening ", DoubleToString(reverse_lots, 2), " lots in the opposite direction.");
+      StartSignal(old_direction == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY, reverse_lots);
+   }
    processing_exit = false;
 }
 
@@ -302,15 +306,16 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
    if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagic) return;
    if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) return;
    ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal, DEAL_REASON);
-   if(reason == DEAL_REASON_SL) ReverseAfterStop();
+   if(reason == DEAL_REASON_SL)
+      ReverseAfterStop(HistoryDealGetDouble(deal, DEAL_VOLUME));
 }
 
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
 {
    if(id != CHARTEVENT_OBJECT_CLICK) return;
    Print("AlgoTrade01 button clicked: ", sparam);
-   if(sparam == PREFIX + "BUY") StartSignal(ORDER_TYPE_BUY);
-   else if(sparam == PREFIX + "SELL") StartSignal(ORDER_TYPE_SELL);
+   if(sparam == PREFIX + "BUY") StartSignal(ORDER_TYPE_BUY, InpOrderLots);
+   else if(sparam == PREFIX + "SELL") StartSignal(ORDER_TYPE_SELL, InpOrderLots);
    else if(sparam == PREFIX + "STOP")
    {
       processing_exit = true;

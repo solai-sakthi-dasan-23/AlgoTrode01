@@ -15,7 +15,7 @@ For a BUY or SELL signal:
 ```
 
 4. Each `0.01` position has a `$2` stop loss. The stack is closed together when the combined floating basket profit reaches `$10`.
-5. If any stack position hits its `$2` stop loss, the EA closes the remaining stack and reverses direction, starting a new `0.01` position.
+5. If any stack position hits its `$2` stop loss, the EA closes the remaining stack and reverses direction, opening the opposite call with the **same lot size as the position that hit SL**. For the current stack this is normally `0.01` lots.
 
 The EA deliberately does not send a broker-side `$1` TP to the first position, because that would close it instead of keeping it open to trigger the 9 additional orders. The `$1` trigger and `$10` combined basket TP are managed by the EA. The `$2` stop loss is applied to every position.
 
