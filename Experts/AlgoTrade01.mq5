@@ -103,7 +103,12 @@ void ResetState()
 
 void MakeButton(string name, string text, int x, color background)
 {
-   ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+   ObjectDelete(0, name);
+   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
+   {
+      Print("Could not create button ", name, ": ", GetLastError());
+      return;
+   }
    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 20);
    ObjectSetInteger(0, name, OBJPROP_XSIZE, 90);
@@ -115,6 +120,32 @@ void MakeButton(string name, string text, int x, color background)
    ObjectSetString(0, name, OBJPROP_TEXT, text);
    ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 100);
+   ChartRedraw(0);
+}
+
+bool ApplyMoneyStops(ulong ticket)
+{
+   if(!IsOurPosition(ticket)) return false;
+   ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double volume = PositionGetDouble(POSITION_VOLUME);
+   double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+   double sl = MoneyStopLoss(type, volume, entry);
+   double tp = MoneyTakeProfit(type, volume, entry);
+   if(sl == 0.0 || tp == 0.0)
+   {
+      Print("Could not calculate monetary SL/TP for ticket ", ticket,
+            ". Check the symbol's tick value and trading specification.");
+      return false;
+   }
+   if(!trade.PositionModify(ticket, sl, tp))
+   {
+      Print("Could not set SL/TP for ticket ", ticket, ": ", trade.ResultRetcodeDescription());
+      return false;
+   }
+   return true;
 }
 
 bool CloseOurPositions()
@@ -140,17 +171,15 @@ bool OpenInitial(ENUM_ORDER_TYPE order_type)
 {
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick)) return false;
-   double price = order_type == ORDER_TYPE_BUY ? tick.ask : tick.bid;
-   ENUM_POSITION_TYPE position_type = order_type == ORDER_TYPE_BUY ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-   double sl = MoneyStopLoss(position_type, InpLots, price);
-   double tp = MoneyTakeProfit(position_type, InpLots, price);
    string comment = "AT01|INIT";
 
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpDeviationPoints);
+   // Send first, then apply stops using the actual fill price. This avoids
+   // broker rejection when spread/slippage makes precomputed stops invalid.
    bool sent = order_type == ORDER_TYPE_BUY
-               ? trade.Buy(InpLots, _Symbol, 0.0, sl, tp, comment)
-               : trade.Sell(InpLots, _Symbol, 0.0, sl, tp, comment);
+               ? trade.Buy(InpLots, _Symbol, 0.0, 0.0, 0.0, comment)
+               : trade.Sell(InpLots, _Symbol, 0.0, 0.0, 0.0, comment);
    if(!sent)
    {
       Print("Initial order failed: ", trade.ResultRetcodeDescription());
@@ -162,7 +191,7 @@ bool OpenInitial(ENUM_ORDER_TYPE order_type)
    for(int i = PositionsTotal() - 1; i >= 0; --i)
    {
       ulong ticket = PositionGetTicket(i);
-      if(IsOurPosition(ticket) && PositionGetString(POSITION_COMMENT) == comment)
+      if(IsOurPosition(ticket) && (PositionGetString(POSITION_COMMENT) == comment || initial_ticket == 0))
       {
          initial_ticket = ticket;
          initial_price = PositionGetDouble(POSITION_PRICE_OPEN);
@@ -178,6 +207,7 @@ bool OpenInitial(ENUM_ORDER_TYPE order_type)
    }
    running = true;
    scaled_in = false;
+   ApplyMoneyStops(initial_ticket);
    Print("Started ", direction == POSITION_TYPE_BUY ? "BUY" : "SELL", " at ", initial_price);
    return true;
 }
@@ -200,15 +230,21 @@ void ScaleIn()
    trade.SetDeviationInPoints(InpDeviationPoints);
    for(int i = 0; i < InpAddOrders; i++)
    {
-      MqlTick tick;
-      if(!SymbolInfoTick(_Symbol, tick)) continue;
-      double entry = direction == POSITION_TYPE_BUY ? tick.ask : tick.bid;
-      double sl = MoneyStopLoss(direction, InpLots, entry);
-      double tp = MoneyTakeProfit(direction, InpLots, entry);
       bool sent = direction == POSITION_TYPE_BUY
-                  ? trade.Buy(InpLots, _Symbol, 0.0, sl, tp, "AT01|ADD")
-                  : trade.Sell(InpLots, _Symbol, 0.0, sl, tp, "AT01|ADD");
+                  ? trade.Buy(InpLots, _Symbol, 0.0, 0.0, 0.0, "AT01|ADD")
+                  : trade.Sell(InpLots, _Symbol, 0.0, 0.0, 0.0, "AT01|ADD");
       if(!sent) Print("Scale-in order ", i + 1, " failed: ", trade.ResultRetcodeDescription());
+      else
+      {
+         // Apply levels to the newly filled position using its actual entry.
+         for(int p = PositionsTotal() - 1; p >= 0; --p)
+         {
+            ulong ticket = PositionGetTicket(p);
+            if(IsOurPosition(ticket) && PositionGetString(POSITION_COMMENT) == "AT01|ADD" &&
+               PositionGetDouble(POSITION_SL) == 0.0)
+               ApplyMoneyStops(ticket);
+         }
+      }
    }
    scaled_in = true;
    Print("Scale-in complete: requested ", InpAddOrders, " additional orders.");
@@ -292,6 +328,7 @@ void OnTimer() { ManageStrategy(); }
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
 {
    if(id != CHARTEVENT_OBJECT_CLICK) return;
+   Print("AlgoTrade01 button clicked: ", sparam);
    if(sparam == PREFIX + "BUY") StartDirection(ORDER_TYPE_BUY);
    else if(sparam == PREFIX + "SELL") StartDirection(ORDER_TYPE_SELL);
    else if(sparam == PREFIX + "STOP")
